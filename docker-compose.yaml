@@ -1,0 +1,151 @@
+version: "3"
+
+services:
+
+  trino:
+    image: trino:464-SNAPSHOT-amd64
+    container_name: trino
+    networks:
+      iceberg-nessie-net:
+    ports:
+      - 8080:8080
+    volumes:
+      - "./catalogs/nessie_catalog.properties:/etc/trino/catalog/nessie_catalog.properties"
+      - "./catalogs/rest_catalog.properties:/etc/trino/catalog/rest_catalog.properties"
+      - "./config.properties:/etc/trino/config.properties"
+
+  trino2:
+    image: trinodb/trino:463
+    container_name: trino2
+    networks:
+      iceberg-nessie-net:
+    ports:
+      - 8081:8080
+    volumes:
+      - "./catalogs/nessie_catalog.properties:/etc/trino/catalog/nessie_catalog.properties"
+      - "./catalogs/rest_catalog.properties:/etc/trino/catalog/rest_catalog.properties"
+      - "./config.properties:/etc/trino/config.properties"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    networks:
+      - iceberg-nessie-net
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+
+  storage:
+    image: minio/minio
+    container_name: storage
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=storage
+      - MINIO_REGION_NAME=us-east-1
+      - MINIO_REGION=us-east-1
+    volumes:
+      - minio_data:/data
+    networks:
+      iceberg-nessie-net:
+        aliases:
+          - warehouse.storage
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+
+  mc:
+    depends_on:
+      - storage
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg-nessie-net:
+        aliases:
+          - minio.storage
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://storage:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc mb minio/iceberg;
+      /usr/bin/mc policy set public minio/warehouse;
+      /usr/bin/mc policy set public minio/iceberg;
+      tail -f /dev/null
+      " 
+
+  nessie:
+    image: projectnessie/nessie
+    container_name: nessie
+    networks:
+      iceberg-nessie-net:
+    ports:
+      - 19120:19120
+    environment:
+      - nessie.version.store.type=IN_MEMORY
+      - nessie.server.authentication.enabled=false
+      - nessie.catalog.default-warehouse=warehouse
+      - nessie.catalog.warehouses.warehouse.location=s3://warehouse/
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.access-key.name=admin
+      - nessie.catalog.service.s3.default-options.access-key.secret=password
+
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: rest
+    networks:
+      - iceberg-nessie-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - 8183:8183
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://storage:9000/warehouse
+      CATALOG_URI: jdbc:postgresql://postgres:5432/datalake_catalog
+      CATALOG_JDBC_USER: admin
+      CATALOG_JDBC_PASSWORD: password
+      REST_PORT: 8183
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: datalake_catalog
+      POSTGRES_HOST_AUTH_METHOD: md5
+    networks:
+      - iceberg-nessie-net
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U admin -d datalake_catalog" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+
+
+networks:
+  iceberg-nessie-net:
+
+volumes:
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
